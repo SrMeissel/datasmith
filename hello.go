@@ -1,7 +1,16 @@
 package main
 
-import "fmt"
+import (
+    "fmt"
+    "strings"
+    "bytes"
+    "encoding/json"
+    "io"
+    "net/http"
+)
+
 import "github.com/charmbracelet/lipgloss"
+import "github.com/charmbracelet/bubbles/viewport"
 import "github.com/charmbracelet/bubbles/textinput"
 import "github.com/charmbracelet/bubbletea"
 
@@ -10,17 +19,32 @@ type Message struct {
     Content string `json:"content"`
 }
 
-var (
-    bgColor   = lipgloss.Color("#1E1E2E")
-    fgColor   = lipgloss.Color("#CDD6F4")
-    accent    = lipgloss.Color("#CBA6F7")
-    borderCol = lipgloss.Color("63")
-)
+//====================================custom bubbletea messages===============
+
+type streamStartMsg struct {
+    reader io.ReadCloser
+    decoder *json.Decoder
+}
+type streamNextMsg struct {
+    content string
+    done bool
+    reader io.ReadCloser
+    decoder *json.Decoder
+}
+
+type aiResponseMsg struct {
+    content string
+    err error
+}
+
+//============================================================================
 
 type Model struct {
     messages []Message
+
     input textinput.Model
-    
+    chatBox viewport.Model
+
     width int 
     height int
 }
@@ -32,7 +56,10 @@ func initialModel() Model {
     ti.CharLimit = 500
     ti.Width = 60
 
-    return Model{input: ti}
+    vp := viewport.New(0, 0)
+    vp.Style = ChatBoxStyle
+
+    return Model{input: ti, chatBox: vp}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -40,13 +67,9 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-    var cmd tea.Cmd
     var cmds []tea.Cmd
 
-
     switch msg := msg.(type) {
-
-//==========================================================system commands=================================
 
     case tea.KeyMsg:
 	switch msg.Type {
@@ -54,33 +77,55 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 	    if m.input.Value() != "" {
 		m.messages = append(m.messages, Message{Role: "user", Content: m.input.Value() })
-
 		m.input.Reset()
 
-		cmds = append(cmds, fetchAIResponse(m.messages))
+		m.chatBox.SetContent(constructChat(m.messages, m.width))
+		m.chatBox.GotoBottom()
+		//cmds = append(cmds, fetchAIResponse(m.messages))
+		cmds = append(cmds, startOllamaStream(m.messages))
 	    }	
 
 	case tea.KeyCtrlC, tea.KeyEsc:
 	    return m, tea.Quit
 	}
 
-//===========================================================================================================
 
     case tea.WindowSizeMsg:
 	m.width = msg.Width
 	m.height = msg.Height
 	m.input.Width = msg.Width - 4
 
+	m.chatBox.Width = msg.Width
+	inputHeight := lipgloss.Height(InputStyle.Render(m.input.View()))
+	m.chatBox.Height = msg.Height - inputHeight// - 1
+
     case aiResponseMsg:
 	if msg.err == nil {
 	    m.messages = append(m.messages, Message{Role: "AI", Content: msg.content})
 	}
+
+    case streamStartMsg:
+	m.messages = append(m.messages, Message{Role:"AI", Content: ""})
+	cmds = append(cmds, readNextChunk(msg.reader, msg.decoder))
+    case streamNextMsg:
+	if msg.done{
+	    break
+	}
+
+	lastIdx := len(m.messages) -1
+	m.messages[lastIdx].Content += msg.content
+
+	m.chatBox.SetContent(constructChat(m.messages, m.width))
+	m.chatBox.GotoBottom()
+
+	cmds = append(cmds, readNextChunk(msg.reader, msg.decoder))
     }
 
-//===========================================textinput bubble update==========================================
-
-    m.input, cmd = m.input.Update(msg)
-    cmds = append(cmds, cmd)
+    //===========================================bubble update==========================================
+    var ipcmd, vpcmd tea.Cmd
+    m.input, ipcmd = m.input.Update(msg)
+    m.chatBox, vpcmd = m.chatBox.Update(msg)
+    cmds = append(cmds,ipcmd, vpcmd)
 
     return m, tea.Batch(cmds...)
 }
@@ -90,48 +135,9 @@ func (m Model) View() string {
 	return "wait."
     }
 
-//======================================compose chat=====================================
+    inputView := InputStyle.Render(m.input.View())
 
-    chat := ""
-    for _, msg := range m.messages {
-	if msg.Role == "user" {
-	    chat += "You: " + msg.Content + "\n\n"
-	} else {
-	    chat += "AI: " + msg.Content + "\n\n"
-	}
-    }
-
-//========================================styles=========================================
-
-    inputStyle := lipgloss.NewStyle().
-    Background(bgColor).
-    Border(lipgloss.RoundedBorder()). 
-    BorderForeground(borderCol).
-    Padding(0, 1).
-    Width(m.width - 2)
-
-    inputView := inputStyle.Render(m.input.View())
-    chatAreaHeight := m.height - lipgloss.Height(inputView) - 1
-
-    chatBox := lipgloss.NewStyle().
-    Width(m.width).
-    Height(chatAreaHeight).
-    Align(lipgloss.Bottom).
-    Render(chat)
-
-    appStyle := lipgloss.NewStyle().
-    Background(bgColor).
-    Foreground(fgColor).
-    Width(m.width).
-    Height(m.height)
-
-    return appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, chatBox, inputView))
-
-}
-
-type aiResponseMsg struct {
-    content string
-    err error
+    return AppStyle.Render(lipgloss.JoinVertical(lipgloss.Left, m.chatBox.View(), inputView))
 }
 
 func fetchAIResponse(messages []Message) tea.Cmd {
@@ -140,6 +146,60 @@ func fetchAIResponse(messages []Message) tea.Cmd {
 	content := "hi"
 	return aiResponseMsg{content: content}
     }
+}
+
+func startOllamaStream(messages []Message) tea.Cmd {
+    return func() tea.Msg {
+	reqBody, _ := json.Marshal(map[string]any{
+	    "model": "flint",
+	    "messages": messages,
+	})
+
+	resp, err := http.Post("192.168.0.15:11434/api/chat", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+	    return nil //TODO: handle error
+	}
+	return streamStartMsg{ reader: resp.Body, decoder: json.NewDecoder(resp.Body) }
+    }
+}
+
+func readNextChunk(reader io.ReadCloser, decoder *json.Decoder) tea.Cmd {
+    return func() tea.Msg {
+	var chunk struct {
+	    Message Message `json:"message"`
+	    Done bool `json:"done"`
+	}
+	err := decoder.Decode(&chunk)
+	if err != nil || chunk.Done {
+	    reader.Close()
+	    return streamNextMsg{done: true}
+	}
+
+	return streamNextMsg{
+	    content: chunk.Message.Content,
+	    reader: reader,
+	    decoder: decoder,
+	}
+    }
+}
+
+func constructChat(messages[] Message,width int) string {
+    UserTextStyle := UserTextStyle.Width(width)
+    ResponseTextStyle := ResponseTextStyle.Width(width)
+
+    var chatBuilder strings.Builder
+    for _, msg := range messages {
+	if msg.Role == "user" {
+	    message := "user:\n" + msg.Content
+	    chatBuilder.WriteString(UserTextStyle.Render(message))
+	    chatBuilder.WriteString("\n\n")
+	} else {
+	    message := "AI:\n" + msg.Content
+	    chatBuilder.WriteString(ResponseTextStyle.Render(message))
+	    chatBuilder.WriteString("\n\n")
+	}
+    }
+    return chatBuilder.String()
 }
 
 func main() {
