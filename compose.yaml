@@ -3,5 +3,11 @@ services:
     build: .
     stdin_open: true
     tty: true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    environment:
+      - API= #URL goes here
+    networks:
+      - ai-net
+
+networks:
+  ai-net:
+    external: true

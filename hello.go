@@ -7,6 +7,7 @@ import (
     "encoding/json"
     "io"
     "net/http"
+    "os"
 )
 
 import "github.com/charmbracelet/lipgloss"
@@ -24,17 +25,13 @@ type Message struct {
 type streamStartMsg struct {
     reader io.ReadCloser
     decoder *json.Decoder
+    err error
 }
 type streamNextMsg struct {
     content string
     done bool
     reader io.ReadCloser
     decoder *json.Decoder
-}
-
-type aiResponseMsg struct {
-    content string
-    err error
 }
 
 //============================================================================
@@ -89,7 +86,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	    return m, tea.Quit
 	}
 
-
     case tea.WindowSizeMsg:
 	m.width = msg.Width
 	m.height = msg.Height
@@ -99,13 +95,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	inputHeight := lipgloss.Height(InputStyle.Render(m.input.View()))
 	m.chatBox.Height = msg.Height - inputHeight// - 1
 
-    case aiResponseMsg:
-	if msg.err == nil {
-	    m.messages = append(m.messages, Message{Role: "AI", Content: msg.content})
-	}
-
     case streamStartMsg:
-	m.messages = append(m.messages, Message{Role:"AI", Content: ""})
+	if msg.err != nil {
+	    errorText := fmt.Sprintf("Error connecting to ollama: %v", msg.err)
+	    m.messages = append(m.messages, Message{Role: "assistant", Content: errorText})
+	    m.chatBox.SetContent(constructChat(m.messages, m.width))
+	    break
+	}
+	m.messages = append(m.messages, Message{Role:"assistant", Content: ""})
 	cmds = append(cmds, readNextChunk(msg.reader, msg.decoder))
     case streamNextMsg:
 	if msg.done{
@@ -140,14 +137,6 @@ func (m Model) View() string {
     return AppStyle.Render(lipgloss.JoinVertical(lipgloss.Left, m.chatBox.View(), inputView))
 }
 
-func fetchAIResponse(messages []Message) tea.Cmd {
-    return func() tea.Msg {
-	//call llm endpoint
-	content := "hi"
-	return aiResponseMsg{content: content}
-    }
-}
-
 func startOllamaStream(messages []Message) tea.Cmd {
     return func() tea.Msg {
 	reqBody, _ := json.Marshal(map[string]any{
@@ -155,9 +144,14 @@ func startOllamaStream(messages []Message) tea.Cmd {
 	    "messages": messages,
 	})
 
-	resp, err := http.Post("192.168.0.15:11434/api/chat", "application/json", bytes.NewReader(reqBody))
+	API := os.Getenv("API")
+	if API == "" {
+	    API = "http://ollama:11434/api/chat"
+	}
+
+	resp, err := http.Post(API, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-	    return nil //TODO: handle error
+	    return streamStartMsg{err: err}
 	}
 	return streamStartMsg{ reader: resp.Body, decoder: json.NewDecoder(resp.Body) }
     }
