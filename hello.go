@@ -1,19 +1,30 @@
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
     "strings"
     "bytes"
     "encoding/json"
     "io"
     "net/http"
+    "net"
     "os"
+    "os/signal"
+    "time"
+    "syscall"
 )
 
 import "github.com/charmbracelet/lipgloss"
 import "github.com/charmbracelet/bubbles/viewport"
 import "github.com/charmbracelet/bubbles/textinput"
 import "github.com/charmbracelet/bubbletea"
+
+import "github.com/charmbracelet/ssh"
+import "github.com/charmbracelet/wish"
+import "github.com/charmbracelet/wish/bubbletea"
+import "github.com/charmbracelet/wish/logging"
 
 type Message struct {
     Role string `json:"role"`
@@ -46,17 +57,36 @@ type Model struct {
     height int
 }
 
-func initialModel() Model {
+func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
     ti := textinput.New()
     ti.Placeholder = "Start Typing..."
     ti.Focus()
     ti.CharLimit = 500
-    ti.Width = 60
 
     vp := viewport.New(0, 0)
     vp.Style = ChatBoxStyle
 
-    return Model{input: ti, chatBox: vp}
+    return Model{input: ti, chatBox: vp},
+    []tea.ProgramOption{tea.WithAltScreen()}
+}
+
+func publicKeyHandler(ctx ssh.Context, key ssh.PublicKey) bool {
+    data, err := os.ReadFile(".ssh/authorized_keys")
+    if err != nil {
+	return false
+    }
+
+    for len(data) > 0 {
+	allowKey, _, _, rest, err := ssh.ParseAuthorizedKey(data)
+	if err != nil {
+	    break
+	}
+	if ssh.KeysEqual(key, allowKey) {
+	    return true
+	}
+	data = rest
+    }
+    return false
 }
 
 func (m Model) Init() tea.Cmd {
@@ -197,9 +227,32 @@ func constructChat(messages[] Message,width int) string {
 }
 
 func main() {
-    m := initialModel()
-    p := tea.NewProgram(m, tea.WithAltScreen())
-    if _, err := p.Run(); err != nil {
-	fmt.Println("Error: ", err);
+    s, err := wish.NewServer(
+	wish.WithAddress(net.JoinHostPort("0.0.0.0", "22")),
+	wish.WithHostKeyPath(".ssh/term_info_ed25519"),
+	wish.WithPublicKeyAuth(publicKeyHandler),
+	wish.WithMiddleware(bubbletea.Middleware(teaHandler), logging.Middleware()),
+    )
+    if err != nil {
+	fmt.Println("Could not start server: ", err)
+	return
+    }
+
+    done := make(chan os.Signal, 1)
+    signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+    fmt.Println("starting SSH server")
+    go func() {
+	if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+	    fmt.Println("Could not listen:", err)
+	}
+    }()
+
+    <-done
+    fmt.Println("Stopping SSH Server")
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    if err := s.Shutdown(ctx); err != nil {
+	fmt.Println("Could not stop server cleanly:", err)
     }
 }

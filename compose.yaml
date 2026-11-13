@@ -1,13 +1,17 @@
 services:
   datasmith:
     build: .
-    stdin_open: true
-    tty: true
     environment:
       - API= #URL goes here
     networks:
       - ai-net
+    ports:
+      - "44:22"
+    volumes:
+      - ssh_keys:/.ssh
 
 networks:
   ai-net:
     external: true
+volumes:
+  ssh_keys: 
