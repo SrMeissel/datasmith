@@ -16,6 +16,8 @@ import (
     "syscall"
 )
 
+import "github.com/muesli/termenv"
+
 import "github.com/charmbracelet/lipgloss"
 import "github.com/charmbracelet/bubbles/viewport"
 import "github.com/charmbracelet/bubbles/textinput"
@@ -61,6 +63,7 @@ type Model struct {
 
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
     renderer := lipgloss.NewRenderer(s)
+    renderer.SetColorProfile(termenv.TrueColor)
     styles := BuildStyles(renderer)
 
     ti := textinput.New()
@@ -213,18 +216,18 @@ func readNextChunk(reader io.ReadCloser, decoder *json.Decoder) tea.Cmd {
 }
 
 func constructChat(m Model, width int) string {
-    m.styles.UserTextStyle.Width(width)
-    m.styles.ResponseTextStyle.Width(width)
+    userStyle := m.styles.UserTextStyle.Width(width)
+    responseStyle := m.styles.ResponseTextStyle.Width(width)
 
     var chatBuilder strings.Builder
     for _, msg := range m.messages {
 	if msg.Role == "user" {
 	    message := "user:\n" + msg.Content
-	    chatBuilder.WriteString(m.styles.UserTextStyle.Render(message))
+	    chatBuilder.WriteString(userStyle.Render(message))
 	    chatBuilder.WriteString("\n\n")
 	} else {
 	    message := "AI:\n" + msg.Content
-	    chatBuilder.WriteString(m.styles.ResponseTextStyle.Render(message))
+	    chatBuilder.WriteString(responseStyle.Render(message))
 	    chatBuilder.WriteString("\n\n")
 	}
     }
