@@ -11,7 +11,8 @@ var (
 	"document": {
 	    "color": "#FFA000",
 	    "block_prefix": "\n",
-	    "block_suffix": "\n"
+	    "block_suffix": "\n",
+	    "background_color": "#111111"
 	},
 	"block_quote": {
 	    "color": "#FFA500",
@@ -19,8 +20,7 @@ var (
 	    "indent_token": "│ "
 	},
 	"paragraph": {
-	    "color": "#FFA000",
-	    "background_color": "#111111"
+	    "color": "#FFA000"
 	},
 	"heading": {
 	    "color": "#FFFFFF",
