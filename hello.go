@@ -1,19 +1,32 @@
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
     "strings"
     "bytes"
     "encoding/json"
     "io"
     "net/http"
+    "net"
     "os"
+    "os/signal"
+    "time"
+    "syscall"
 )
+
+import "github.com/muesli/termenv"
 
 import "github.com/charmbracelet/lipgloss"
 import "github.com/charmbracelet/bubbles/viewport"
 import "github.com/charmbracelet/bubbles/textinput"
 import "github.com/charmbracelet/bubbletea"
+
+import "github.com/charmbracelet/ssh"
+import "github.com/charmbracelet/wish"
+import "github.com/charmbracelet/wish/bubbletea"
+import "github.com/charmbracelet/wish/logging"
 
 type Message struct {
     Role string `json:"role"`
@@ -44,19 +57,44 @@ type Model struct {
 
     width int 
     height int
+
+    styles Styles
 }
 
-func initialModel() Model {
+func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+    renderer := lipgloss.NewRenderer(s)
+    renderer.SetColorProfile(termenv.TrueColor)
+    styles := BuildStyles(renderer)
+
     ti := textinput.New()
     ti.Placeholder = "Start Typing..."
     ti.Focus()
     ti.CharLimit = 500
-    ti.Width = 60
 
     vp := viewport.New(0, 0)
-    vp.Style = ChatBoxStyle
+    vp.Style = styles.ChatBoxStyle
 
-    return Model{input: ti, chatBox: vp}
+    return Model{input: ti, chatBox: vp, styles: styles},
+    []tea.ProgramOption{tea.WithAltScreen()}
+}
+
+func publicKeyHandler(ctx ssh.Context, key ssh.PublicKey) bool {
+    data, err := os.ReadFile(".ssh/authorized_keys")
+    if err != nil {
+	return false
+    }
+
+    for len(data) > 0 {
+	allowKey, _, _, rest, err := ssh.ParseAuthorizedKey(data)
+	if err != nil {
+	    break
+	}
+	if ssh.KeysEqual(key, allowKey) {
+	    return true
+	}
+	data = rest
+    }
+    return false
 }
 
 func (m Model) Init() tea.Cmd {
@@ -76,7 +114,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messages = append(m.messages, Message{Role: "user", Content: m.input.Value() })
 		m.input.Reset()
 
-		m.chatBox.SetContent(constructChat(m.messages, m.width))
+		m.chatBox.SetContent(constructChat(m, m.width))
 		m.chatBox.GotoBottom()
 		//cmds = append(cmds, fetchAIResponse(m.messages))
 		cmds = append(cmds, startOllamaStream(m.messages))
@@ -92,14 +130,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.input.Width = msg.Width - 4
 
 	m.chatBox.Width = msg.Width
-	inputHeight := lipgloss.Height(InputStyle.Render(m.input.View()))
+	inputHeight := lipgloss.Height(m.styles.InputStyle.Render(m.input.View()))
 	m.chatBox.Height = msg.Height - inputHeight// - 1
 
     case streamStartMsg:
 	if msg.err != nil {
 	    errorText := fmt.Sprintf("Error connecting to ollama: %v", msg.err)
 	    m.messages = append(m.messages, Message{Role: "assistant", Content: errorText})
-	    m.chatBox.SetContent(constructChat(m.messages, m.width))
+	    m.chatBox.SetContent(constructChat(m, m.width))
 	    break
 	}
 	m.messages = append(m.messages, Message{Role:"assistant", Content: ""})
@@ -112,7 +150,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	lastIdx := len(m.messages) -1
 	m.messages[lastIdx].Content += msg.content
 
-	m.chatBox.SetContent(constructChat(m.messages, m.width))
+	m.chatBox.SetContent(constructChat(m, m.width))
 	m.chatBox.GotoBottom()
 
 	cmds = append(cmds, readNextChunk(msg.reader, msg.decoder))
@@ -132,9 +170,9 @@ func (m Model) View() string {
 	return "wait."
     }
 
-    inputView := InputStyle.Render(m.input.View())
+    inputView := m.styles.InputStyle.Render(m.input.View())
 
-    return AppStyle.Render(lipgloss.JoinVertical(lipgloss.Left, m.chatBox.View(), inputView))
+    return m.styles.AppStyle.Render(lipgloss.JoinVertical(lipgloss.Left, m.chatBox.View(), inputView))
 }
 
 func startOllamaStream(messages []Message) tea.Cmd {
@@ -177,19 +215,19 @@ func readNextChunk(reader io.ReadCloser, decoder *json.Decoder) tea.Cmd {
     }
 }
 
-func constructChat(messages[] Message,width int) string {
-    UserTextStyle := UserTextStyle.Width(width)
-    ResponseTextStyle := ResponseTextStyle.Width(width)
+func constructChat(m Model, width int) string {
+    userStyle := m.styles.UserTextStyle.Width(width)
+    responseStyle := m.styles.ResponseTextStyle.Width(width)
 
     var chatBuilder strings.Builder
-    for _, msg := range messages {
+    for _, msg := range m.messages {
 	if msg.Role == "user" {
 	    message := "user:\n" + msg.Content
-	    chatBuilder.WriteString(UserTextStyle.Render(message))
+	    chatBuilder.WriteString(userStyle.Render(message))
 	    chatBuilder.WriteString("\n\n")
 	} else {
 	    message := "AI:\n" + msg.Content
-	    chatBuilder.WriteString(ResponseTextStyle.Render(message))
+	    chatBuilder.WriteString(responseStyle.Render(message))
 	    chatBuilder.WriteString("\n\n")
 	}
     }
@@ -197,9 +235,32 @@ func constructChat(messages[] Message,width int) string {
 }
 
 func main() {
-    m := initialModel()
-    p := tea.NewProgram(m, tea.WithAltScreen())
-    if _, err := p.Run(); err != nil {
-	fmt.Println("Error: ", err);
+    s, err := wish.NewServer(
+	wish.WithAddress(net.JoinHostPort("0.0.0.0", "22")),
+	wish.WithHostKeyPath(".ssh/term_info_ed25519"),
+	wish.WithPublicKeyAuth(publicKeyHandler),
+	wish.WithMiddleware(bubbletea.Middleware(teaHandler), logging.Middleware()),
+    )
+    if err != nil {
+	fmt.Println("Could not start server: ", err)
+	return
+    }
+
+    done := make(chan os.Signal, 1)
+    signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+    fmt.Println("starting SSH server")
+    go func() {
+	if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+	    fmt.Println("Could not listen:", err)
+	}
+    }()
+
+    <-done
+    fmt.Println("Stopping SSH Server")
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    if err := s.Shutdown(ctx); err != nil {
+	fmt.Println("Could not stop server cleanly:", err)
     }
 }
