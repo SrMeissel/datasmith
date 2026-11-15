@@ -19,6 +19,7 @@ import (
 import "github.com/muesli/termenv"
 
 import "github.com/charmbracelet/lipgloss"
+import "github.com/charmbracelet/glamour"
 import "github.com/charmbracelet/bubbles/viewport"
 import "github.com/charmbracelet/bubbles/textinput"
 import "github.com/charmbracelet/bubbletea"
@@ -217,7 +218,12 @@ func readNextChunk(reader io.ReadCloser, decoder *json.Decoder) tea.Cmd {
 
 func constructChat(m Model, width int) string {
     userStyle := m.styles.UserTextStyle.Width(width)
-    responseStyle := m.styles.ResponseTextStyle.Width(width)
+    //responseStyle := m.styles.ResponseTextStyle.Width(width)
+
+    renderer, _ := glamour.NewTermRenderer(
+        glamour.WithStylesFromJSONBytes([]byte(MarkdownTheme)),
+        glamour.WithWordWrap(width),
+    )
 
     var chatBuilder strings.Builder
     for _, msg := range m.messages {
@@ -227,7 +233,11 @@ func constructChat(m Model, width int) string {
 	    chatBuilder.WriteString("\n\n")
 	} else {
 	    message := "AI:\n" + msg.Content
-	    chatBuilder.WriteString(responseStyle.Render(message))
+	    mdContent, err := renderer.Render(message)
+            if err != nil {
+                mdContent = message
+            }
+	    chatBuilder.WriteString(mdContent)
 	    chatBuilder.WriteString("\n\n")
 	}
     }
